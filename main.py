@@ -1,19 +1,18 @@
-# main.py
 import asyncio
 import os
-from app.application.use_cases import FetchPolymarketEventUseCase
+from config.settings import DATABASE_URL
+from app.application.use_cases import FetchPolymarketEventUseCase, StreamPolymarketDataUseCase
+from app.infrastructure.db_repository import PostgresRepository
+from app.infrastructure.binance_api import BinanceRESTClient
 
 def clear_screen():
-    """Membersihkan layar terminal sesuai dengan OS (Windows/Unix)."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def print_header():
-    """Mencetak header aplikasi."""
-    print("=== PolyTrade-CLI (Phase 1: Discovery) ===")
-    print("=" * 42 + "\n")
+    print("=== PolyTrade-CLI (Core Engine 24/7) ===")
+    print("=" * 40 + "\n")
 
 def select_from_menu(title: str, options: list) -> str:
-    """Menampilkan menu pilihan dan menangkap input angka."""
     print(title)
     print("-" * 30)
     for idx, option in enumerate(options, 1):
@@ -23,62 +22,91 @@ def select_from_menu(title: str, options: list) -> str:
     while True:
         try:
             choice = input("Pilih nomor (atau Ctrl+C untuk batal): ").strip()
-            choice_int = int(choice)
-            
-            if 1 <= choice_int <= len(options):
-                return options[choice_int - 1]
-            else:
-                print(f"🔴 Pilihan tidak valid. Harap masukkan angka antara 1 dan {len(options)}.")
+            if 1 <= int(choice) <= len(options):
+                return options[int(choice) - 1]
+            print(f"🔴 Pilihan tidak valid.")
         except ValueError:
             print("🔴 Input harus berupa angka.")
         except KeyboardInterrupt:
-            print("\nMembatalkan operasi...")
             exit()
 
 async def main():
-    # 1. Tampilkan List Asset
     clear_screen()
     print_header()
-    daftar_asset = ['BTC', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE', 'ETH']
-    asset_input = select_from_menu("Pilih Asset yang ingin dipantau:", daftar_asset)
+    asset_input = select_from_menu("Pilih Asset:", ['BTC', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE', 'ETH'])
     
-    # 2. Tampilkan List Timeframe (Layar dibersihkan dulu)
     clear_screen()
     print_header()
     print(f"[✓] Asset terpilih: {asset_input}\n")
-    daftar_timeframe = ['5m', '15m']
-    timeframe_input = select_from_menu("Pilih Timeframe Polymarket:", daftar_timeframe)
+    timeframe_input = select_from_menu("Pilih Timeframe:", ['5m', '15m'])
     
-    # 3. Proses Pencarian API (Layar dibersihkan dulu)
     clear_screen()
     print_header()
-    print(f"[SYSTEM] Memulai pencarian untuk: {asset_input} pada timeframe {timeframe_input}")
-    print("-" * 50)
     
-    use_case = FetchPolymarketEventUseCase()
+    # 1. INISIASI DATABASE
+    db_repo = PostgresRepository(dsn=DATABASE_URL)
+    await db_repo.connect()
     
-    try:
-        # Menjalankan workflow Fase 1
-        event_result = await use_case.execute(asset=asset_input, timeframe=timeframe_input)
-        
-        # Logika Penentuan Status Visual
-        if event_result.is_active and not event_result.is_closed:
-            status_visual = "🟢 ACTIVE"
-        else:
-            status_visual = "🔴 CLOSED"
+    fetch_use_case = FetchPolymarketEventUseCase()
+    stream_use_case = StreamPolymarketDataUseCase(db_repo=db_repo)
+    binance_client = BinanceRESTClient()
 
-        # Log Checkpoint
-        print("\n[SYSTEM] Market Found!")
-        print(f"[SYSTEM] Name          : {event_result.name}")
-        print(f"[SYSTEM] Slug          : {event_result.slug}")
-        print(f"[SYSTEM] Status        : {status_visual}")
-        print(f"[SYSTEM] Token ID (YES): {event_result.token_id_yes}")
-        print(f"[SYSTEM] Token ID (NO) : {event_result.token_id_no}")
-        print("\n[SYSTEM] Proceeding to WebSocket connection... (Ready for Phase 2)")
-        print("=" * 50)
-        
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
+    # INFINITE LOOP UNTUK AUTO-ROLLOVER
+    while True:
+        try:
+            print(f"\n[SYSTEM] Memulai pencarian market untuk: {asset_input} ({timeframe_input})")
+            
+            # FASE 1: Cari Market Polymarket & Harga Binance
+            event_result = await fetch_use_case.execute(asset=asset_input, timeframe=timeframe_input)
+            binance_price = await binance_client.get_current_price(asset_input)
+            
+            print("\n" + "=" * 50)
+            print(f"[BINANCE] {asset_input} Current Spot Price: ${binance_price:,.2f}")
+            print("=" * 50)
+            print(f"[POLYMARKET] Name : {event_result.name}")
+
+            if event_result.is_closed or not event_result.is_active:
+                print("[SYSTEM] Market saat ini tertutup. Menunggu siklus selanjutnya dalam 10 detik...")
+                await asyncio.sleep(10)
+                continue # Mengulang loop pencarian
+
+            # FASE 2: Streaming
+            print("[SYSTEM] Menghubungkan ke WebSocket Polymarket... (Tekan Ctrl+C untuk Stop)\n")
+            market_state = {"YES": {"bid": 0.0, "ask": 0.0}, "NO": {"bid": 0.0, "ask": 0.0}}
+
+            async for update in stream_use_case.execute(event_result, asset_input, timeframe_input, binance_price):
+                
+                if update["type"] == "ui_update":
+                    data = update["data"]
+                    top_bid = data.bids[0].price if data.bids else market_state[data.asset_name]["bid"]
+                    top_ask = data.asks[0].price if data.asks else market_state[data.asset_name]["ask"]
+                    
+                    market_state[data.asset_name]["bid"] = top_bid
+                    market_state[data.asset_name]["ask"] = top_ask
+
+                    print(f"\r[LIVE] YES | B: {market_state['YES']['bid']:.2f} A: {market_state['YES']['ask']:.2f}  ||  NO | B: {market_state['NO']['bid']:.2f} A: {market_state['NO']['ask']:.2f}  ||  Vol: ${data.current_volume:,.2f}    ", end="", flush=True)
+
+                elif update["type"] == "system_log":
+                    # Menghapus baris [LIVE] sementara agar log tercetak rapi
+                    print(f"\r{' ' * 80}\r[EVENT] {update['message']}")
+
+                elif update["type"] == "rollover":
+                    print(f"\r{' ' * 80}\r[SYSTEM] Melakukan Rollover Otomatis ke Market Selanjutnya...\n")
+                    break # Pecah stream loop, kembali ke Phase 1 di atas!
+
+        except asyncio.CancelledError:
+            print("\n[SYSTEM] Streaming dihentikan.")
+            break
+        except KeyboardInterrupt:
+            print("\n[SYSTEM] Keluar dari aplikasi.")
+            break
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
+            print("[SYSTEM] Mencoba kembali dalam 5 detik...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
